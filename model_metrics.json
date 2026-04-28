@@ -1,0 +1,13 @@
+{
+  "auc_roc": 1.0,
+  "auc_roc_terrain": 0.9997,
+  "cv_mean": 0.9994,
+  "cv_std": 0.0009,
+  "precision": 0.9917,
+  "recall": 0.9958,
+  "f1": 0.9938,
+  "n_train": 8000,
+  "n_test": 2000,
+  "n_terrain_test": 596,
+  "model_version": "TraceIMEI-BJ v2.0-RF"
+}
