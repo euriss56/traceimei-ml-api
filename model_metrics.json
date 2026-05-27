@@ -1,0 +1,45 @@
+{
+  "model_version": "TraceIMEI-BJ v2.1-RF",
+  "data_origin": "synthetic",
+  "data_origin_note": "Métriques calculées sur données synthétiques (profils Bénin-contexte). Non représentatives des conditions terrain réelles.",
+
+  "metrics_synthetic": {
+    "auc_roc": 1.0,
+    "cv_mean": 1.0,
+    "cv_std": 0.0,
+    "precision": 1.0,
+    "recall": 1.0,
+    "f1": 1.0,
+    "n_train": 7360,
+    "n_test": 1840
+  },
+
+  "metrics_terrain": {
+    "auc_roc": null,
+    "status": "calibration_terrain_en_cours",
+    "note": "Validation sur données réelles prévue — pilote shadow mode 30j"
+  },
+
+  "production_readiness": "scoring_rules_validated",
+  "confidence_level": "low_until_terrain_validation",
+
+  "n_features": 7,
+  "features": [
+    "imei_luhn_valid",
+    "tac_manufacturer_match",
+    "sim_swap_frequency_30d",
+    "geoloc_dispersion_km",
+    "repair_history_count",
+    "network_registration_pattern",
+    "imei_age_vs_model_age"
+  ],
+
+  "changes_v2.1": [
+    "photo_model_mismatch_score removed (0% importance)",
+    "Test IMEIs added to training data as stolen",
+    "Blacklist pre-inference in app.py",
+    "Fallback defaults increased (sim_swap=3, geoloc=30km, repair=3)",
+    "sklearn==1.6.1 pinned in requirements.txt",
+    "Métriques synthétiques séparées des métriques terrain (v2.1 honest)"
+  ]
+}
