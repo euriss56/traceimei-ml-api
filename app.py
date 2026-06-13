@@ -1,8 +1,13 @@
 """
-TraceIMEI-BJ — API ML v3.1
-Auto-training au démarrage si modèle absent.
-Moteur : Random Forest 70% + Isolation Forest 30%
-10 features comportementales
+TraceIMEI-BJ — API ML v3.2
+Logique métier corrigée :
+  - VOLÉ     → is_declared_stolen=True envoyé par le frontend (source : Supabase)
+  - SUSPECT  → ML détecte anomalie comportementale (score >= 0.50)
+  - LÉGITIME → Luhn valide + TAC connu + comportement normal
+
+Le ML ne peut PAS décider seul qu'un IMEI est VOLÉ.
+Le frontend consulte Supabase, puis passe is_declared_stolen à l'API.
+
 Auteur : Euriss FANOU & Thierry MEHOUNOU — GETECH 2026
 """
 
@@ -195,6 +200,7 @@ def train_and_save():
         return [luhn,tac_known,all_same,is_test,length_ok,
                 tac_theft,digit_e,check_freq,hour_norm,days_seen]
 
+    # Dataset : label 1 = comportement suspect (pas nécessairement volé)
     records = []
     for _ in range(1800):
         records.append(_features(_gen_valid_imei(), 0) + [0])
@@ -231,23 +237,24 @@ def train_and_save():
         "iso_min": iso_min, "iso_max": iso_max,
         "feature_names": feature_names,
         "n_features": len(feature_names),
-        "version": "3.1"
+        "version": "3.2"
     }
     joblib.dump(bundle, MODEL_PATH)
 
     metrics = {
-        "model_version":      "TraceIMEI-BJ v3.1-RF+IF",
+        "model_version":      "TraceIMEI-BJ v3.2-RF+IF",
         "n_features":         len(feature_names),
         "feature_names":      feature_names,
         "dataset_size":       len(records),
         "data_origin":        "synthetic_behavioral_v3",
         "rf_estimators":      200,
         "iso_contamination":  0.4,
+        "logic_note":         "VOLÉ=Supabase | SUSPECT=ML>=0.50 | LÉGITIME=ML<0.50"
     }
     with open(METRICS_PATH, "w") as f:
         json.dump(metrics, f, indent=2, ensure_ascii=False)
 
-    print("✅ Modèle v3.1 entraîné et sauvegardé.")
+    print("✅ Modèle v3.2 entraîné et sauvegardé.")
     return bundle, metrics
 
 # ────────────────────────────────────────────────────────────
@@ -276,20 +283,35 @@ def load_model():
         with open(METRICS_PATH) as f:
             METRICS = json.load(f)
     else:
-        METRICS = {"model_version": "TraceIMEI-BJ v3.1-RF"}
+        METRICS = {"model_version": "TraceIMEI-BJ v3.2-RF+IF"}
 
 load_model()
 
 # ────────────────────────────────────────────────────────────
-# SCORING
+# SCORING — LOGIQUE MÉTIER v3.2
+#
+# Règle fondamentale :
+#   1. Si is_declared_stolen=True  → VOLÉ   (décision Supabase, ML enrichit)
+#   2. Si ML score >= 0.50         → SUSPECT (ML détecte comportement anormal)
+#   3. Sinon                       → LÉGITIME
+#
+# Le ML ne sort JAMAIS "volé" seul. Il détecte des anomalies comportementales.
 # ────────────────────────────────────────────────────────────
 
 def compute_ml_score(imei: str, ctx: dict = {}):
+    """
+    Retourne (score, mode, confidence).
+    Score = probabilité d'anomalie comportementale (0.0 → 1.0).
+    Ne détermine PAS si l'IMEI est volé — c'est le rôle de Supabase.
+    """
+    # IMEI de test connus → score maximum
     if imei in TEST_IMEIS:
         return 0.99, "blacklist", "high"
+    # IMEI avec tous les chiffres identiques → clairement invalide
     if imei and len(imei) == 15 and len(set(imei)) == 1:
         return 0.99, "blacklist", "high"
 
+    # Fallback si modèle absent
     if MODEL is None:
         score = 0.0
         if not luhn_check(imei): score += 0.40
@@ -305,6 +327,20 @@ def compute_ml_score(imei: str, ctx: dict = {}):
     score = round(min(0.70 * rf_proba + 0.30 * iso_norm, 0.99), 3)
     return score, "scoring_v3", "high"
 
+
+def resolve_status(score: float, is_declared_stolen: bool) -> str:
+    """
+    Logique métier officielle v3.2 :
+      - VOLÉ     : déclaré volé dans Supabase (is_declared_stolen=True)
+      - SUSPECT  : ML détecte anomalie comportementale (score >= 0.50)
+      - LÉGITIME : comportement normal, non déclaré volé
+    """
+    if is_declared_stolen:
+        return "vole"
+    if score >= 0.50:
+        return "suspect"
+    return "legitime"
+
 # ────────────────────────────────────────────────────────────
 # ROUTES
 # ────────────────────────────────────────────────────────────
@@ -313,11 +349,12 @@ def compute_ml_score(imei: str, ctx: dict = {}):
 def index():
     return jsonify({
         "name":         "TraceIMEI-BJ API",
-        "version":      "3.1.0",
+        "version":      "3.2.0",
         "engine":       "Random Forest 70% + Isolation Forest 30%",
         "n_features":   MODEL["n_features"] if MODEL else 10,
         "status":       "running",
         "model_loaded": MODEL is not None,
+        "logic":        "VOLE=Supabase | SUSPECT=ML>=0.50 | LEGITIME=ML<0.50",
     })
 
 
@@ -327,32 +364,49 @@ def health():
         "status":       "ok",
         "model_loaded": MODEL is not None,
         "scoring_mode": "scoring_v3" if MODEL else "fallback_rules",
-        "version":      "3.1.0",
+        "version":      "3.2.0",
         "timestamp":    time.time(),
     })
 
 
 @app.route("/api/check-imei", methods=["POST"])
 def check_imei():
+    """
+    Body attendu :
+    {
+        "imei": "358441080000000",
+        "is_declared_stolen": false,   ← envoyé par le frontend depuis Supabase
+        "context": {                   ← optionnel
+            "check_count": 3,
+            "hour": 22,
+            "days_since_first_seen": 5
+        }
+    }
+    """
     start = time.time()
     data  = request.get_json()
     if not data or "imei" not in data:
         return jsonify({"error": "IMEI manquant"}), 400
 
-    imei = str(data.get("imei", "")).strip()
-    ctx  = data.get("context", {})
+    imei               = str(data.get("imei", "")).strip()
+    ctx                = data.get("context", {})
+    # Clé principale : envoyée par le frontend après consultation Supabase
+    is_declared_stolen = bool(data.get("is_declared_stolen", False))
 
     luhn                         = luhn_check(imei)
     manufacturer, series, tac_ok = get_manufacturer(imei)
     score, mode, confidence      = compute_ml_score(imei, ctx)
-    status = "vole" if score >= 0.80 else "suspect" if score >= 0.50 else "legitime"
+
+    # ← LOGIQUE MÉTIER CENTRALISÉE ICI
+    status = resolve_status(score, is_declared_stolen)
 
     return jsonify({
-        "imei":         imei,
-        "score":        score,
-        "status":       status,
-        "manufacturer": manufacturer,
-        "model_series": series,
+        "imei":               imei,
+        "score":              score,
+        "status":             status,
+        "is_declared_stolen": is_declared_stolen,
+        "manufacturer":       manufacturer,
+        "model_series":       series,
         "features": {
             "luhn_valid":             luhn,
             "imei_length_valid":      len(imei) == 15,
@@ -361,42 +415,56 @@ def check_imei():
             "all_same_digits":        len(set(imei)) == 1 if imei else False,
             "known_test_imei":        imei in TEST_IMEIS,
         },
-        "scoring_mode":     mode,
-        "confidence":       confidence,
-        "response_time_ms": round((time.time() - start) * 1000, 2),
-        "model_version":    METRICS.get("model_version", "TraceIMEI-BJ v3.1-RF"),
+        "scoring_mode":       mode,
+        "confidence":         confidence,
+        "response_time_ms":   round((time.time() - start) * 1000, 2),
+        "model_version":      METRICS.get("model_version", "TraceIMEI-BJ v3.2-RF+IF"),
+        "logic_version":      "v3.2",
     })
 
 
 @app.route("/api/batch-check", methods=["POST"])
 def batch_check():
+    """
+    Body attendu :
+    {
+        "imeis": ["imei1", "imei2", ...],
+        "declared_stolen_list": ["imei1"],   ← liste des IMEI déclarés volés (depuis Supabase)
+        "context": {}
+    }
+    """
     data = request.get_json()
     if not data or "imeis" not in data:
         return jsonify({"error": "Liste IMEI manquante"}), 400
 
-    imeis   = data.get("imeis", [])[:50]
-    ctx     = data.get("context", {})
-    results = []
+    imeis               = data.get("imeis", [])[:50]
+    ctx                 = data.get("context", {})
+    # Le frontend passe la liste des IMEI confirmés volés dans Supabase
+    declared_stolen_set = set(data.get("declared_stolen_list", []))
+    results             = []
 
     for imei in imeis:
-        imei   = str(imei).strip()
+        imei               = str(imei).strip()
+        is_declared_stolen = imei in declared_stolen_set
         score, mode, confidence      = compute_ml_score(imei, ctx)
         manufacturer, series, tac_ok = get_manufacturer(imei)
-        status = "vole" if score >= 0.80 else "suspect" if score >= 0.50 else "legitime"
+        status = resolve_status(score, is_declared_stolen)
         results.append({
-            "imei":         imei,
-            "score":        score,
-            "status":       status,
-            "manufacturer": manufacturer,
-            "tac_match":    tac_ok,
-            "scoring_mode": mode,
-            "confidence":   confidence,
+            "imei":               imei,
+            "score":              score,
+            "status":             status,
+            "is_declared_stolen": is_declared_stolen,
+            "manufacturer":       manufacturer,
+            "tac_match":          tac_ok,
+            "scoring_mode":       mode,
+            "confidence":         confidence,
         })
 
     return jsonify({
         "results":       results,
         "total":         len(results),
-        "model_version": METRICS.get("model_version", "TraceIMEI-BJ v3.1-RF"),
+        "model_version": METRICS.get("model_version", "TraceIMEI-BJ v3.2-RF+IF"),
+        "logic_version": "v3.2",
     })
 
 
@@ -406,7 +474,7 @@ def retrain():
     global MODEL, METRICS
     try:
         MODEL, METRICS = train_and_save()
-        return jsonify({"status": "ok", "message": "Modèle réentraîné avec succès", "version": "3.1"})
+        return jsonify({"status": "ok", "message": "Modèle réentraîné avec succès", "version": "3.2"})
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
 
