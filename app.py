@@ -125,7 +125,6 @@ def build_features(imei: str, ctx: dict = {}) -> list:
 # ────────────────────────────────────────────────────────────
 
 def train_and_save():
-    """Entraîne RF + IF sur dataset synthétique et sauvegarde le modèle."""
     from sklearn.ensemble import RandomForestClassifier, IsolationForest
 
     print("🔧 Entraînement du modèle en cours...")
@@ -200,7 +199,6 @@ def train_and_save():
         return [luhn,tac_known,all_same,is_test,length_ok,
                 tac_theft,digit_e,check_freq,hour_norm,days_seen]
 
-    # Dataset : label 1 = comportement suspect (pas nécessairement volé)
     records = []
     for _ in range(1800):
         records.append(_features(_gen_valid_imei(), 0) + [0])
@@ -258,18 +256,26 @@ def train_and_save():
     return bundle, metrics
 
 # ────────────────────────────────────────────────────────────
-# CHARGEMENT (ou entraînement) DU MODÈLE
+# CHARGEMENT DU MODÈLE — avec validation du bundle
 # ────────────────────────────────────────────────────────────
 
 MODEL   = None
 METRICS = {}
 
+REQUIRED_BUNDLE_KEYS = ["rf", "iso", "iso_min", "iso_max", "n_features"]
+
 def load_model():
     global MODEL, METRICS
     if os.path.exists(MODEL_PATH):
         try:
-            MODEL = joblib.load(MODEL_PATH)
-            print(f"✅ Modèle v{MODEL.get('version','?')} chargé.")
+            loaded = joblib.load(MODEL_PATH)
+            # Rejette les vieux .pkl incompatibles (ex: entraîné avec sklearn 1.6.x)
+            if not all(k in loaded for k in REQUIRED_BUNDLE_KEYS):
+                print("⚠️  Bundle incomplet (vieux modèle détecté), réentraînement forcé...")
+                MODEL, METRICS = train_and_save()
+                return
+            MODEL = loaded
+            print(f"✅ Modèle v{MODEL.get('version','?')} chargé ({MODEL['n_features']} features).")
         except Exception as e:
             print(f"⚠️  Modèle corrompu ({e}), réentraînement...")
             MODEL, METRICS = train_and_save()
@@ -288,30 +294,15 @@ def load_model():
 load_model()
 
 # ────────────────────────────────────────────────────────────
-# SCORING — LOGIQUE MÉTIER v3.2
-#
-# Règle fondamentale :
-#   1. Si is_declared_stolen=True  → VOLÉ   (décision Supabase, ML enrichit)
-#   2. Si ML score >= 0.50         → SUSPECT (ML détecte comportement anormal)
-#   3. Sinon                       → LÉGITIME
-#
-# Le ML ne sort JAMAIS "volé" seul. Il détecte des anomalies comportementales.
+# SCORING
 # ────────────────────────────────────────────────────────────
 
 def compute_ml_score(imei: str, ctx: dict = {}):
-    """
-    Retourne (score, mode, confidence).
-    Score = probabilité d'anomalie comportementale (0.0 → 1.0).
-    Ne détermine PAS si l'IMEI est volé — c'est le rôle de Supabase.
-    """
-    # IMEI de test connus → score maximum
     if imei in TEST_IMEIS:
         return 0.99, "blacklist", "high"
-    # IMEI avec tous les chiffres identiques → clairement invalide
     if imei and len(imei) == 15 and len(set(imei)) == 1:
         return 0.99, "blacklist", "high"
 
-    # Fallback si modèle absent
     if MODEL is None:
         score = 0.0
         if not luhn_check(imei): score += 0.40
@@ -331,9 +322,9 @@ def compute_ml_score(imei: str, ctx: dict = {}):
 def resolve_status(score: float, is_declared_stolen: bool) -> str:
     """
     Logique métier officielle v3.2 :
-      - VOLÉ     : déclaré volé dans Supabase (is_declared_stolen=True)
-      - SUSPECT  : ML détecte anomalie comportementale (score >= 0.50)
-      - LÉGITIME : comportement normal, non déclaré volé
+      VOLÉ     → is_declared_stolen=True (source : Supabase via frontend)
+      SUSPECT  → score ML >= 0.50
+      LÉGITIME → score ML < 0.50 et non déclaré volé
     """
     if is_declared_stolen:
         return "vole"
@@ -351,7 +342,7 @@ def index():
         "name":         "TraceIMEI-BJ API",
         "version":      "3.2.0",
         "engine":       "Random Forest 70% + Isolation Forest 30%",
-        "n_features":   MODEL["n_features"] if MODEL else 10,
+        "n_features":   MODEL.get("n_features", 10) if MODEL else 10,
         "status":       "running",
         "model_loaded": MODEL is not None,
         "logic":        "VOLE=Supabase | SUSPECT=ML>=0.50 | LEGITIME=ML<0.50",
@@ -361,11 +352,12 @@ def index():
 @app.route("/api/health", methods=["GET"])
 def health():
     return jsonify({
-        "status":       "ok",
-        "model_loaded": MODEL is not None,
-        "scoring_mode": "scoring_v3" if MODEL else "fallback_rules",
-        "version":      "3.2.0",
-        "timestamp":    time.time(),
+        "status":        "ok",
+        "model_loaded":  MODEL is not None,
+        "model_version": MODEL.get("version", "?") if MODEL else "none",
+        "scoring_mode":  "scoring_v3" if MODEL else "fallback_rules",
+        "version":       "3.2.0",
+        "timestamp":     time.time(),
     })
 
 
@@ -375,8 +367,8 @@ def check_imei():
     Body attendu :
     {
         "imei": "358441080000000",
-        "is_declared_stolen": false,   ← envoyé par le frontend depuis Supabase
-        "context": {                   ← optionnel
+        "is_declared_stolen": false,
+        "context": {
             "check_count": 3,
             "hour": 22,
             "days_since_first_seen": 5
@@ -390,15 +382,12 @@ def check_imei():
 
     imei               = str(data.get("imei", "")).strip()
     ctx                = data.get("context", {})
-    # Clé principale : envoyée par le frontend après consultation Supabase
     is_declared_stolen = bool(data.get("is_declared_stolen", False))
 
     luhn                         = luhn_check(imei)
     manufacturer, series, tac_ok = get_manufacturer(imei)
     score, mode, confidence      = compute_ml_score(imei, ctx)
-
-    # ← LOGIQUE MÉTIER CENTRALISÉE ICI
-    status = resolve_status(score, is_declared_stolen)
+    status                       = resolve_status(score, is_declared_stolen)
 
     return jsonify({
         "imei":               imei,
@@ -429,7 +418,7 @@ def batch_check():
     Body attendu :
     {
         "imeis": ["imei1", "imei2", ...],
-        "declared_stolen_list": ["imei1"],   ← liste des IMEI déclarés volés (depuis Supabase)
+        "declared_stolen_list": ["imei1"],
         "context": {}
     }
     """
@@ -439,7 +428,6 @@ def batch_check():
 
     imeis               = data.get("imeis", [])[:50]
     ctx                 = data.get("context", {})
-    # Le frontend passe la liste des IMEI confirmés volés dans Supabase
     declared_stolen_set = set(data.get("declared_stolen_list", []))
     results             = []
 
@@ -470,11 +458,15 @@ def batch_check():
 
 @app.route("/api/retrain", methods=["POST"])
 def retrain():
-    """Endpoint pour forcer un réentraînement sans redéployer."""
     global MODEL, METRICS
     try:
         MODEL, METRICS = train_and_save()
-        return jsonify({"status": "ok", "message": "Modèle réentraîné avec succès", "version": "3.2"})
+        return jsonify({
+            "status":     "ok",
+            "message":    "Modèle réentraîné avec succès",
+            "version":    "3.2",
+            "n_features": MODEL["n_features"],
+        })
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
 
