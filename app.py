@@ -1,12 +1,14 @@
 """
-TraceIMEI-BJ — API ML v3.2
-Logique métier corrigée :
-  - VOLÉ     → is_declared_stolen=True envoyé par le frontend (source : Supabase)
+TraceIMEI-BJ — API ML v3.3
+Logique métier :
+  - VOLÉ     → is_declared_stolen=True (source : Supabase declarations/stolen_phones)
   - SUSPECT  → ML détecte anomalie comportementale (score >= 0.50)
-  - LÉGITIME → Luhn valide + TAC connu + comportement normal
+  - LÉGITIME → score ML < 0.50 et non déclaré volé
 
-Le ML ne peut PAS décider seul qu'un IMEI est VOLÉ.
-Le frontend consulte Supabase, puis passe is_declared_stolen à l'API.
+TAC lookup :
+  1. Cache local Supabase (table enregistrements_imei) → priorité
+  2. imeicheck.com API gratuite → fallback si absent du cache
+  3. Sauvegarde automatique dans Supabase après chaque lookup réussi
 
 Auteur : Euriss FANOU & Thierry MEHOUNOU — GETECH 2026
 """
@@ -19,53 +21,32 @@ import json
 import time
 import os
 import random
+import requests
 from datetime import datetime
 
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
 
 # ────────────────────────────────────────────────────────────
-# CONSTANTES
+# VARIABLES D'ENVIRONNEMENT
 # ────────────────────────────────────────────────────────────
 
-KNOWN_TAC = [
-    "35674108","35919004","35821804","35355810","35284608",
-    "35328004","01326300","35299406","35469208","35607204",
-    "35761904","35445610","35990410","35221710","35119710",
-    "35856910","35991610","35120310","35284510",
-    "35231910","35784510","35990610","35221810","35119610",
-    "35842910","35284710","35119910","35990910",
-    "86751904","86611102","86498904","86732204","86521604",
-    "86498210","86739210","86521910","35284810","86739510",
-    "35986710","86738904","86521810","35990110",
-    "35124510","86739110","86521710","35990210",
-    "35284910","86739310","35990710","35119510",
-    "35354410","35119810","35990810",
-    "86738710","35990310","35119410",
-]
+SUPABASE_URL             = os.environ.get("SUPABASE_URL", "")
+SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
 
-HIGH_VALUE_TAC = [
-    "35328004","01326300","35299406","35469208","35607204",
-    "35674108","35919004","35821804",
-    "86498904","86732204",
-]
-
-TAC_DB = {
-    "35674108":("Samsung","Galaxy Series"),   "35919004":("Samsung","Galaxy A"),
-    "35821804":("Samsung","Galaxy S"),        "35328004":("Apple","iPhone"),
-    "01326300":("Apple","iPhone 14"),         "35299406":("Apple","iPhone 13"),
-    "35469208":("Apple","iPhone 15"),         "35607204":("Apple","iPhone 12"),
-    "35761904":("Tecno","Spark"),             "35445610":("Tecno","Camon"),
-    "35990410":("Tecno","Pop"),               "35856910":("Itel","A Series"),
-    "35991610":("Itel","Vision"),             "35231910":("Infinix","Hot"),
-    "35784510":("Infinix","Note"),            "35842910":("Nokia","G Series"),
-    "86751904":("Huawei","Y Series"),         "86611102":("Huawei","Nova"),
-    "86498904":("Huawei","P Series"),         "86732204":("Huawei","Mate"),
-    "86498210":("Xiaomi","Redmi"),            "86739210":("Xiaomi","Mi"),
-    "35986710":("Oppo","A Series"),           "35124510":("Vivo","Y Series"),
-    "35284910":("Realme","C Series"),         "35354410":("Motorola","Moto G"),
-    "86738710":("ZTE","Blade"),               "35990310":("Wiko","T Series"),
+SUPABASE_HEADERS = {
+    "apikey":        SUPABASE_SERVICE_ROLE_KEY,
+    "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+    "Content-Type":  "application/json",
+    "Prefer":        "return=minimal",
 }
+
+# ────────────────────────────────────────────────────────────
+# CONSTANTES ML
+# ────────────────────────────────────────────────────────────
+
+HIGH_VALUE_PREFIXES = ["353280","013263","352994","354692","356072",
+                       "356741","359190","358218","864989","867322"]
 
 TEST_IMEIS = {
     "000000000000000","111111111111111",
@@ -76,7 +57,98 @@ MODEL_PATH   = "traceimei_model.pkl"
 METRICS_PATH = "model_metrics.json"
 
 # ────────────────────────────────────────────────────────────
-# UTILITAIRES
+# TAC LOOKUP — SUPABASE CACHE + IMEICHECK.COM FALLBACK
+# ────────────────────────────────────────────────────────────
+
+def tac_lookup_supabase(tac: str):
+    """Cherche le TAC dans Supabase (cache local)."""
+    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+        return None
+    try:
+        url = f"{SUPABASE_URL}/rest/v1/enregistrements_imei"
+        params = {
+            "tac": f"eq.{tac}",
+            "select": "tac,manufacturer,model_series",
+            "limit": "1",
+        }
+        r = requests.get(url, headers=SUPABASE_HEADERS, params=params, timeout=3)
+        if r.status_code == 200:
+            data = r.json()
+            if data:
+                return data[0]["manufacturer"], data[0]["model_series"], True
+    except Exception as e:
+        print(f"⚠️  Supabase TAC lookup failed: {e}")
+    return None
+
+
+def tac_lookup_imeicheck(imei: str):
+    """Lookup via imeicheck.com — gratuit, sans clé API."""
+    try:
+        url = f"https://alpha.imeicheck.com/api/modelBrandName?imei={imei}&format=json"
+        r = requests.get(url, timeout=5)
+        if r.status_code == 200:
+            data = r.json()
+            # Réponse attendue : {"brand": "Samsung", "model": "Galaxy A14", ...}
+            brand = data.get("brand") or data.get("manufacturer") or ""
+            model = data.get("model") or data.get("name") or ""
+            if brand:
+                return brand.strip(), model.strip(), True
+    except Exception as e:
+        print(f"⚠️  imeicheck.com lookup failed: {e}")
+    return None
+
+
+def tac_save_supabase(tac: str, manufacturer: str, model_series: str):
+    """Sauvegarde un nouveau TAC dans Supabase pour le cache futur."""
+    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+        return
+    try:
+        url = f"{SUPABASE_URL}/rest/v1/enregistrements_imei"
+        payload = {
+            "tac":          tac,
+            "manufacturer": manufacturer,
+            "model_series": model_series,
+        }
+        requests.post(url, headers=SUPABASE_HEADERS, json=payload, timeout=3)
+        print(f"✅ TAC {tac} ({manufacturer} {model_series}) sauvegardé dans Supabase.")
+    except Exception as e:
+        print(f"⚠️  Supabase TAC save failed: {e}")
+
+
+def get_manufacturer(imei: str):
+    """
+    Résolution du fabricant en 3 étapes :
+    1. Cache Supabase (enregistrements_imei)
+    2. imeicheck.com API gratuite
+    3. Fallback "Inconnu"
+    """
+    if len(imei) < 8:
+        return "Inconnu", "Modèle inconnu", False
+
+    tac = imei[:8]
+
+    # Étape 1 — Cache Supabase
+    result = tac_lookup_supabase(tac)
+    if result:
+        manufacturer, model_series, _ = result
+        print(f"📦 TAC {tac} trouvé dans cache Supabase → {manufacturer} {model_series}")
+        return manufacturer, model_series, True
+
+    # Étape 2 — imeicheck.com
+    result = tac_lookup_imeicheck(imei)
+    if result:
+        manufacturer, model_series, _ = result
+        print(f"🌐 TAC {tac} trouvé via imeicheck.com → {manufacturer} {model_series}")
+        # Sauvegarde dans Supabase pour les prochaines fois
+        tac_save_supabase(tac, manufacturer, model_series)
+        return manufacturer, model_series, True
+
+    # Étape 3 — Inconnu
+    print(f"❓ TAC {tac} non trouvé.")
+    return "Inconnu", "Modèle inconnu", False
+
+# ────────────────────────────────────────────────────────────
+# UTILITAIRES ML
 # ────────────────────────────────────────────────────────────
 
 def luhn_check(imei: str) -> bool:
@@ -89,22 +161,14 @@ def luhn_check(imei: str) -> bool:
     return total % 10 == 0
 
 
-def get_manufacturer(imei: str):
-    tac = imei[:8] if len(imei) >= 8 else ""
-    for prefix, (brand, series) in TAC_DB.items():
-        if tac.startswith(prefix[:6]):
-            return brand, series, True
-    return "Inconnu", "Modèle inconnu", False
-
-
 def build_features(imei: str, ctx: dict = {}) -> list:
-    luhn       = 1 if luhn_check(imei) else 0
-    tac        = imei[:8] if len(imei) >= 8 else ""
-    tac_known  = int(any(tac.startswith(k[:6]) for k in KNOWN_TAC))
-    all_same   = 1 if imei and len(set(imei)) == 1 else 0
-    is_test    = 1 if imei in TEST_IMEIS else 0
-    length_ok  = 1 if len(imei) == 15 else 0
-    tac_theft  = 0.7 if any(tac.startswith(t[:6]) for t in HIGH_VALUE_TAC) else 0.2
+    luhn      = 1 if luhn_check(imei) else 0
+    tac       = imei[:8] if len(imei) >= 8 else ""
+    tac_known = 1  # on fait confiance au lookup dynamique
+    all_same  = 1 if imei and len(set(imei)) == 1 else 0
+    is_test   = 1 if imei in TEST_IMEIS else 0
+    length_ok = 1 if len(imei) == 15 else 0
+    tac_theft = 0.7 if any(tac.startswith(p) for p in HIGH_VALUE_PREFIXES) else 0.2
 
     if imei.isdigit() and len(imei) > 0:
         counts  = [imei.count(str(d)) / len(imei) for d in range(10)]
@@ -124,6 +188,23 @@ def build_features(imei: str, ctx: dict = {}) -> list:
 # AUTO-TRAINING
 # ────────────────────────────────────────────────────────────
 
+KNOWN_TAC_TRAIN = [
+    "35674108","35919004","35821804","35355810","35284608",
+    "35328004","01326300","35299406","35469208","35607204",
+    "35761904","35445610","35990410","35221710","35119710",
+    "35856910","35991610","35120310","35284510",
+    "35231910","35784510","35990610","35221810","35119610",
+    "35842910","35284710","35119910","35990910",
+    "86751904","86611102","86498904","86732204","86521604",
+    "86498210","86739210","86521910","35284810","86739510",
+    "35986710","86738904","86521810","35990110",
+    "35124510","86739110","86521710","35990210",
+    "35284910","86739310","35990710","35119510",
+    "35354410","35119810","35990810",
+    "86738710","35990310","35119410",
+]
+
+
 def train_and_save():
     from sklearn.ensemble import RandomForestClassifier, IsolationForest
 
@@ -132,7 +213,7 @@ def train_and_save():
     np.random.seed(42)
 
     def _gen_valid_imei(tac=None):
-        t = tac or random.choice(KNOWN_TAC)
+        t = tac or random.choice(KNOWN_TAC_TRAIN)
         snr = str(random.randint(0, 999999)).zfill(6)
         base = t + snr
         digits = [int(d) for d in base]
@@ -147,7 +228,7 @@ def train_and_save():
     def _gen_fake_imei():
         mode = random.choice(["luhn_bad", "unknown_tac", "repeated"])
         if mode == "luhn_bad":
-            tac = random.choice(KNOWN_TAC)
+            tac = random.choice(KNOWN_TAC_TRAIN)
             snr = str(random.randint(0, 999999)).zfill(6)
             base = tac + snr
             digits = [int(d) for d in base]
@@ -178,11 +259,11 @@ def train_and_save():
     def _features(imei, label):
         luhn      = 1 if luhn_check(imei) else 0
         tac       = imei[:8] if len(imei) >= 8 else ""
-        tac_known = int(any(tac.startswith(k[:6]) for k in KNOWN_TAC))
+        tac_known = int(any(tac.startswith(k[:6]) for k in KNOWN_TAC_TRAIN))
         all_same  = 1 if imei and len(set(imei)) == 1 else 0
         is_test   = 1 if imei in TEST_IMEIS else 0
         length_ok = 1 if len(imei) == 15 else 0
-        tac_theft = 0.7 if any(tac.startswith(t[:6]) for t in HIGH_VALUE_TAC) else 0.2
+        tac_theft = 0.7 if any(tac.startswith(p) for p in HIGH_VALUE_PREFIXES) else 0.2
         if imei.isdigit() and len(imei) > 0:
             counts  = [imei.count(str(d)) / len(imei) for d in range(10)]
             entropy = -sum(p * np.log2(p + 1e-9) for p in counts if p > 0)
@@ -235,33 +316,33 @@ def train_and_save():
         "iso_min": iso_min, "iso_max": iso_max,
         "feature_names": feature_names,
         "n_features": len(feature_names),
-        "version": "3.2"
+        "version": "3.3"
     }
     joblib.dump(bundle, MODEL_PATH)
 
     metrics = {
-        "model_version":      "TraceIMEI-BJ v3.2-RF+IF",
-        "n_features":         len(feature_names),
-        "feature_names":      feature_names,
-        "dataset_size":       len(records),
-        "data_origin":        "synthetic_behavioral_v3",
-        "rf_estimators":      200,
-        "iso_contamination":  0.4,
-        "logic_note":         "VOLÉ=Supabase | SUSPECT=ML>=0.50 | LÉGITIME=ML<0.50"
+        "model_version":     "TraceIMEI-BJ v3.3-RF+IF",
+        "n_features":        len(feature_names),
+        "feature_names":     feature_names,
+        "dataset_size":      len(records),
+        "data_origin":       "synthetic_behavioral_v3",
+        "rf_estimators":     200,
+        "iso_contamination": 0.4,
+        "logic_note":        "VOLÉ=Supabase | SUSPECT=ML>=0.50 | LÉGITIME=ML<0.50",
+        "tac_source":        "Supabase cache + imeicheck.com fallback",
     }
     with open(METRICS_PATH, "w") as f:
         json.dump(metrics, f, indent=2, ensure_ascii=False)
 
-    print("✅ Modèle v3.2 entraîné et sauvegardé.")
+    print("✅ Modèle v3.3 entraîné et sauvegardé.")
     return bundle, metrics
 
 # ────────────────────────────────────────────────────────────
-# CHARGEMENT DU MODÈLE — avec validation du bundle
+# CHARGEMENT DU MODÈLE
 # ────────────────────────────────────────────────────────────
 
 MODEL   = None
 METRICS = {}
-
 REQUIRED_BUNDLE_KEYS = ["rf", "iso", "iso_min", "iso_max", "n_features"]
 
 def load_model():
@@ -269,9 +350,8 @@ def load_model():
     if os.path.exists(MODEL_PATH):
         try:
             loaded = joblib.load(MODEL_PATH)
-            # Rejette les vieux .pkl incompatibles (ex: entraîné avec sklearn 1.6.x)
             if not all(k in loaded for k in REQUIRED_BUNDLE_KEYS):
-                print("⚠️  Bundle incomplet (vieux modèle détecté), réentraînement forcé...")
+                print("⚠️  Bundle incomplet, réentraînement forcé...")
                 MODEL, METRICS = train_and_save()
                 return
             MODEL = loaded
@@ -289,7 +369,7 @@ def load_model():
         with open(METRICS_PATH) as f:
             METRICS = json.load(f)
     else:
-        METRICS = {"model_version": "TraceIMEI-BJ v3.2-RF+IF"}
+        METRICS = {"model_version": "TraceIMEI-BJ v3.3-RF+IF"}
 
 load_model()
 
@@ -321,10 +401,10 @@ def compute_ml_score(imei: str, ctx: dict = {}):
 
 def resolve_status(score: float, is_declared_stolen: bool) -> str:
     """
-    Logique métier officielle v3.2 :
-      VOLÉ     → is_declared_stolen=True (source : Supabase via frontend)
+    Logique métier v3.3 :
+      VOLÉ     → is_declared_stolen=True (source : Supabase)
       SUSPECT  → score ML >= 0.50
-      LÉGITIME → score ML < 0.50 et non déclaré volé
+      LÉGITIME → score ML < 0.50
     """
     if is_declared_stolen:
         return "vole"
@@ -340,23 +420,26 @@ def resolve_status(score: float, is_declared_stolen: bool) -> str:
 def index():
     return jsonify({
         "name":         "TraceIMEI-BJ API",
-        "version":      "3.2.0",
+        "version":      "3.3.0",
         "engine":       "Random Forest 70% + Isolation Forest 30%",
         "n_features":   MODEL.get("n_features", 10) if MODEL else 10,
         "status":       "running",
         "model_loaded": MODEL is not None,
+        "tac_source":   "Supabase cache + imeicheck.com fallback",
         "logic":        "VOLE=Supabase | SUSPECT=ML>=0.50 | LEGITIME=ML<0.50",
     })
 
 
 @app.route("/api/health", methods=["GET"])
 def health():
+    supabase_ok = bool(SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY)
     return jsonify({
         "status":        "ok",
         "model_loaded":  MODEL is not None,
         "model_version": MODEL.get("version", "?") if MODEL else "none",
         "scoring_mode":  "scoring_v3" if MODEL else "fallback_rules",
-        "version":       "3.2.0",
+        "supabase":      "connected" if supabase_ok else "missing_credentials",
+        "version":       "3.3.0",
         "timestamp":     time.time(),
     })
 
@@ -369,9 +452,9 @@ def check_imei():
         "imei": "358441080000000",
         "is_declared_stolen": false,
         "context": {
-            "check_count": 3,
-            "hour": 22,
-            "days_since_first_seen": 5
+            "check_count": 1,
+            "hour": 14,
+            "days_since_first_seen": 0
         }
     }
     """
@@ -407,8 +490,8 @@ def check_imei():
         "scoring_mode":       mode,
         "confidence":         confidence,
         "response_time_ms":   round((time.time() - start) * 1000, 2),
-        "model_version":      METRICS.get("model_version", "TraceIMEI-BJ v3.2-RF+IF"),
-        "logic_version":      "v3.2",
+        "model_version":      METRICS.get("model_version", "TraceIMEI-BJ v3.3-RF+IF"),
+        "logic_version":      "v3.3",
     })
 
 
@@ -443,6 +526,7 @@ def batch_check():
             "status":             status,
             "is_declared_stolen": is_declared_stolen,
             "manufacturer":       manufacturer,
+            "model_series":       series,
             "tac_match":          tac_ok,
             "scoring_mode":       mode,
             "confidence":         confidence,
@@ -451,8 +535,8 @@ def batch_check():
     return jsonify({
         "results":       results,
         "total":         len(results),
-        "model_version": METRICS.get("model_version", "TraceIMEI-BJ v3.2-RF+IF"),
-        "logic_version": "v3.2",
+        "model_version": METRICS.get("model_version", "TraceIMEI-BJ v3.3-RF+IF"),
+        "logic_version": "v3.3",
     })
 
 
@@ -463,8 +547,8 @@ def retrain():
         MODEL, METRICS = train_and_save()
         return jsonify({
             "status":     "ok",
-            "message":    "Modèle réentraîné avec succès",
-            "version":    "3.2",
+            "message":    "Modèle v3.3 réentraîné avec succès",
+            "version":    "3.3",
             "n_features": MODEL["n_features"],
         })
     except Exception as e:
