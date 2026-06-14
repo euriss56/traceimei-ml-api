@@ -1,9 +1,15 @@
 """
-TraceIMEI-BJ — API ML v3.3
+TraceIMEI-BJ — API ML v3.5
 Logique métier :
   - VOLÉ     → is_declared_stolen=True (source : Supabase declarations/stolen_phones)
-  - SUSPECT  → ML détecte anomalie comportementale (score >= 0.50)
-  - LÉGITIME → score ML < 0.50 et non déclaré volé
+  - SUSPECT  → Isolation Forest détecte une anomalie (iso_score >= 0.50)
+               OU IMEI vérifié >= 5 fois dans la même journée (table verifications_imei)
+  - LÉGITIME → aucune des conditions ci-dessus
+
+Rôle du Random Forest :
+  - Ne décide plus du statut
+  - Contribue uniquement au score final pour affichage (pondération 40%)
+  - Isolation Forest = décideur principal (pondération 60%)
 
 TAC lookup :
   1. Cache local Supabase (table enregistrements_imei) → priorité
@@ -22,7 +28,7 @@ import time
 import os
 import random
 import requests
-from datetime import datetime
+from datetime import datetime, timezone
 
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
@@ -31,7 +37,7 @@ CORS(app, resources={r"/*": {"origins": "*"}})
 # VARIABLES D'ENVIRONNEMENT
 # ────────────────────────────────────────────────────────────
 
-SUPABASE_URL             = os.environ.get("SUPABASE_URL", "")
+SUPABASE_URL              = os.environ.get("SUPABASE_URL", "")
 SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
 
 SUPABASE_HEADERS = {
@@ -45,31 +51,53 @@ SUPABASE_HEADERS = {
 # CONSTANTES ML
 # ────────────────────────────────────────────────────────────
 
-HIGH_VALUE_PREFIXES = ["353280","013263","352994","354692","356072",
-                       "356741","359190","358218","864989","867322"]
+HIGH_VALUE_PREFIXES = [
+    "353280", "013263", "352994", "354692", "356072",
+    "356741", "359190", "358218", "864989", "867322",
+]
 
 TEST_IMEIS = {
-    "000000000000000","111111111111111",
-    "123456789012345","999999999999999",
+    "000000000000000", "111111111111111",
+    "123456789012345", "999999999999999",
 }
+
+# Seuil de vérifications répétées dans la journée → SUSPECT
+DAILY_CHECK_THRESHOLD = 5
+
+# Seuil Isolation Forest normalisé → SUSPECT
+ISO_ANOMALY_THRESHOLD = 0.50
 
 MODEL_PATH   = "traceimei_model.pkl"
 METRICS_PATH = "model_metrics.json"
+
+FEATURE_NAMES = [
+    "luhn",
+    "tac_known_real",
+    "all_same",
+    "is_test",
+    "length_ok",
+    "tac_theft_rate",
+    "digit_entropy",
+    "hour_norm",
+    "days_seen",
+    "consecutive",
+    "unique_digit_ratio",
+    "is_night",
+]
 
 # ────────────────────────────────────────────────────────────
 # TAC LOOKUP — SUPABASE CACHE + IMEICHECK.COM FALLBACK
 # ────────────────────────────────────────────────────────────
 
 def tac_lookup_supabase(tac: str):
-    """Cherche le TAC dans Supabase (cache local)."""
     if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
         return None
     try:
         url = f"{SUPABASE_URL}/rest/v1/enregistrements_imei"
         params = {
-            "tac": f"eq.{tac}",
+            "tac":    f"eq.{tac}",
             "select": "tac,manufacturer,model_series",
-            "limit": "1",
+            "limit":  "1",
         }
         r = requests.get(url, headers=SUPABASE_HEADERS, params=params, timeout=3)
         if r.status_code == 200:
@@ -82,13 +110,11 @@ def tac_lookup_supabase(tac: str):
 
 
 def tac_lookup_imeicheck(imei: str):
-    """Lookup via imeicheck.com — gratuit, sans clé API."""
     try:
         url = f"https://alpha.imeicheck.com/api/modelBrandName?imei={imei}&format=json"
         r = requests.get(url, timeout=5)
         if r.status_code == 200:
-            data = r.json()
-            # Réponse attendue : {"brand": "Samsung", "model": "Galaxy A14", ...}
+            data  = r.json()
             brand = data.get("brand") or data.get("manufacturer") or ""
             model = data.get("model") or data.get("name") or ""
             if brand:
@@ -99,53 +125,68 @@ def tac_lookup_imeicheck(imei: str):
 
 
 def tac_save_supabase(tac: str, manufacturer: str, model_series: str):
-    """Sauvegarde un nouveau TAC dans Supabase pour le cache futur."""
     if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
         return
     try:
-        url = f"{SUPABASE_URL}/rest/v1/enregistrements_imei"
-        payload = {
-            "tac":          tac,
-            "manufacturer": manufacturer,
-            "model_series": model_series,
-        }
+        url     = f"{SUPABASE_URL}/rest/v1/enregistrements_imei"
+        payload = {"tac": tac, "manufacturer": manufacturer, "model_series": model_series}
         requests.post(url, headers=SUPABASE_HEADERS, json=payload, timeout=3)
-        print(f"✅ TAC {tac} ({manufacturer} {model_series}) sauvegardé dans Supabase.")
+        print(f"✅ TAC {tac} sauvegardé dans Supabase.")
     except Exception as e:
         print(f"⚠️  Supabase TAC save failed: {e}")
 
 
 def get_manufacturer(imei: str):
-    """
-    Résolution du fabricant en 3 étapes :
-    1. Cache Supabase (enregistrements_imei)
-    2. imeicheck.com API gratuite
-    3. Fallback "Inconnu"
-    """
     if len(imei) < 8:
         return "Inconnu", "Modèle inconnu", False
-
     tac = imei[:8]
-
-    # Étape 1 — Cache Supabase
     result = tac_lookup_supabase(tac)
     if result:
         manufacturer, model_series, _ = result
-        print(f"📦 TAC {tac} trouvé dans cache Supabase → {manufacturer} {model_series}")
         return manufacturer, model_series, True
-
-    # Étape 2 — imeicheck.com
     result = tac_lookup_imeicheck(imei)
     if result:
         manufacturer, model_series, _ = result
-        print(f"🌐 TAC {tac} trouvé via imeicheck.com → {manufacturer} {model_series}")
-        # Sauvegarde dans Supabase pour les prochaines fois
         tac_save_supabase(tac, manufacturer, model_series)
         return manufacturer, model_series, True
-
-    # Étape 3 — Inconnu
-    print(f"❓ TAC {tac} non trouvé.")
     return "Inconnu", "Modèle inconnu", False
+
+# ────────────────────────────────────────────────────────────
+# SUPABASE — COMPTAGE DES VÉRIFICATIONS JOURNALIÈRES
+# ────────────────────────────────────────────────────────────
+
+def get_daily_check_count(imei: str) -> int:
+    """
+    Interroge la table verifications_imei pour compter combien de fois
+    cet IMEI a été vérifié aujourd'hui (UTC).
+    Colonnes attendues : imei (text), created_at (timestamptz)
+    """
+    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+        return 0
+    try:
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        url   = f"{SUPABASE_URL}/rest/v1/verifications_imei"
+        params = {
+            "imei":       f"eq.{imei}",
+            "created_at": f"gte.{today}T00:00:00Z",
+            "select":     "imei",
+        }
+        # On utilise prefer: count=exact pour récupérer le total
+        headers = {
+            **SUPABASE_HEADERS,
+            "Prefer": "count=exact",
+        }
+        r = requests.get(url, headers=headers, params=params, timeout=3)
+        if r.status_code in (200, 206):
+            content_range = r.headers.get("Content-Range", "")
+            # Format : "0-4/12" → total = 12
+            if "/" in content_range:
+                return int(content_range.split("/")[1])
+            # Fallback : compter les lignes retournées
+            return len(r.json())
+    except Exception as e:
+        print(f"⚠️  Supabase daily check count failed: {e}")
+    return 0
 
 # ────────────────────────────────────────────────────────────
 # UTILITAIRES ML
@@ -162,9 +203,13 @@ def luhn_check(imei: str) -> bool:
 
 
 def build_features(imei: str, ctx: dict = {}) -> list:
+    """
+    Vecteur de 12 features pour RF + Isolation Forest.
+    check_freq et repeat_check supprimés : la fréquence
+    est désormais décidée via Supabase (get_daily_check_count).
+    """
     luhn      = 1 if luhn_check(imei) else 0
     tac       = imei[:8] if len(imei) >= 8 else ""
-    tac_known = 1  # on fait confiance au lookup dynamique
     all_same  = 1 if imei and len(set(imei)) == 1 else 0
     is_test   = 1 if imei in TEST_IMEIS else 0
     length_ok = 1 if len(imei) == 15 else 0
@@ -177,47 +222,63 @@ def build_features(imei: str, ctx: dict = {}) -> list:
     else:
         digit_e = 0.0
 
-    check_freq = min(int(ctx.get("check_count", 1)), 15) / 15
-    hour_norm  = int(ctx.get("hour", datetime.utcnow().hour)) / 23
-    days_seen  = float(ctx.get("days_since_first_seen", 0)) / 365
+    tac_known_real     = 1 if bool(ctx.get("tac_found", False)) else 0
+    hour_val           = int(ctx.get("hour", datetime.utcnow().hour))
+    hour_norm          = hour_val / 23
+    days_seen          = float(ctx.get("days_since_first_seen", 0)) / 365
 
-    return [luhn, tac_known, all_same, is_test, length_ok,
-            tac_theft, digit_e, check_freq, hour_norm, days_seen]
+    # Séquences consécutives
+    if imei.isdigit() and len(imei) == 15:
+        consecutive = sum(
+            1 for i in range(len(imei) - 1)
+            if int(imei[i + 1]) - int(imei[i]) == 1
+        ) / 14
+    else:
+        consecutive = 0.0
+
+    unique_digit_ratio = len(set(imei)) / 10 if imei.isdigit() else 0.0
+    is_night           = 1 if (hour_val >= 22 or hour_val <= 5) else 0
+
+    return [
+        luhn, tac_known_real, all_same, is_test, length_ok,
+        tac_theft, digit_e, hour_norm, days_seen,
+        consecutive, unique_digit_ratio, is_night,
+    ]
 
 # ────────────────────────────────────────────────────────────
-# AUTO-TRAINING
+# AUTO-TRAINING v3.5
 # ────────────────────────────────────────────────────────────
 
 KNOWN_TAC_TRAIN = [
-    "35674108","35919004","35821804","35355810","35284608",
-    "35328004","01326300","35299406","35469208","35607204",
-    "35761904","35445610","35990410","35221710","35119710",
-    "35856910","35991610","35120310","35284510",
-    "35231910","35784510","35990610","35221810","35119610",
-    "35842910","35284710","35119910","35990910",
-    "86751904","86611102","86498904","86732204","86521604",
-    "86498210","86739210","86521910","35284810","86739510",
-    "35986710","86738904","86521810","35990110",
-    "35124510","86739110","86521710","35990210",
-    "35284910","86739310","35990710","35119510",
-    "35354410","35119810","35990810",
-    "86738710","35990310","35119410",
+    "35674108", "35919004", "35821804", "35355810", "35284608",
+    "35328004", "01326300", "35299406", "35469208", "35607204",
+    "35761904", "35445610", "35990410", "35221710", "35119710",
+    "35856910", "35991610", "35120310", "35284510",
+    "35231910", "35784510", "35990610", "35221810", "35119610",
+    "35842910", "35284710", "35119910", "35990910",
+    "86751904", "86611102", "86498904", "86732204", "86521604",
+    "86498210", "86739210", "86521910", "35284810", "86739510",
+    "35986710", "86738904", "86521810", "35990110",
+    "35124510", "86739110", "86521710", "35990210",
+    "35284910", "86739310", "35990710", "35119510",
+    "35354410", "35119810", "35990810",
+    "86738710", "35990310", "35119410",
 ]
 
 
 def train_and_save():
     from sklearn.ensemble import RandomForestClassifier, IsolationForest
 
-    print("🔧 Entraînement du modèle en cours...")
+    print("🔧 Entraînement du modèle v3.5 en cours...")
     random.seed(42)
     np.random.seed(42)
 
     def _gen_valid_imei(tac=None):
-        t = tac or random.choice(KNOWN_TAC_TRAIN)
-        snr = str(random.randint(0, 999999)).zfill(6)
-        base = t + snr
+        t      = tac or random.choice(KNOWN_TAC_TRAIN)
+        snr    = str(random.randint(0, 999999)).zfill(6)
+        base   = t + snr
         digits = [int(d) for d in base]
-        total = 0
+        total  = 0
         for i, d in enumerate(reversed(digits)):
             if i % 2 == 1:
                 d *= 2
@@ -226,10 +287,10 @@ def train_and_save():
         return base + str((10 - total % 10) % 10)
 
     def _gen_fake_imei():
-        mode = random.choice(["luhn_bad", "unknown_tac", "repeated"])
+        mode = random.choice(["luhn_bad", "unknown_tac", "repeated", "sequential"])
         if mode == "luhn_bad":
-            tac = random.choice(KNOWN_TAC_TRAIN)
-            snr = str(random.randint(0, 999999)).zfill(6)
+            tac  = random.choice(KNOWN_TAC_TRAIN)
+            snr  = str(random.randint(0, 999999)).zfill(6)
             base = tac + snr
             digits = [int(d) for d in base]
             total = 0
@@ -243,10 +304,20 @@ def train_and_save():
             return base + str(bad)
         elif mode == "unknown_tac":
             fake_tac = str(random.randint(10000000, 99999999))
-            snr = str(random.randint(0, 999999)).zfill(6)
-            base = fake_tac + snr
+            snr      = str(random.randint(0, 999999)).zfill(6)
+            base     = fake_tac + snr
+            digits   = [int(d) for d in base]
+            total    = 0
+            for i, d in enumerate(reversed(digits)):
+                if i % 2 == 1:
+                    d *= 2
+                    if d > 9: d -= 9
+                total += d
+            return base + str((10 - total % 10) % 10)
+        elif mode == "sequential":
+            base   = "".join([str(i % 10) for i in range(14)])
             digits = [int(d) for d in base]
-            total = 0
+            total  = 0
             for i, d in enumerate(reversed(digits)):
                 if i % 2 == 1:
                     d *= 2
@@ -257,28 +328,47 @@ def train_and_save():
             return str(random.randint(0, 9)) * 15
 
     def _features(imei, label):
-        luhn      = 1 if luhn_check(imei) else 0
-        tac       = imei[:8] if len(imei) >= 8 else ""
-        tac_known = int(any(tac.startswith(k[:6]) for k in KNOWN_TAC_TRAIN))
-        all_same  = 1 if imei and len(set(imei)) == 1 else 0
-        is_test   = 1 if imei in TEST_IMEIS else 0
-        length_ok = 1 if len(imei) == 15 else 0
-        tac_theft = 0.7 if any(tac.startswith(p) for p in HIGH_VALUE_PREFIXES) else 0.2
+        luhn           = 1 if luhn_check(imei) else 0
+        tac            = imei[:8] if len(imei) >= 8 else ""
+        tac_known_real = int(any(tac.startswith(k[:6]) for k in KNOWN_TAC_TRAIN))
+        all_same       = 1 if imei and len(set(imei)) == 1 else 0
+        is_test        = 1 if imei in TEST_IMEIS else 0
+        length_ok      = 1 if len(imei) == 15 else 0
+        tac_theft      = 0.7 if any(tac.startswith(p) for p in HIGH_VALUE_PREFIXES) else 0.2
+
         if imei.isdigit() and len(imei) > 0:
             counts  = [imei.count(str(d)) / len(imei) for d in range(10)]
             entropy = -sum(p * np.log2(p + 1e-9) for p in counts if p > 0)
             digit_e = round(entropy / np.log2(10), 4)
         else:
             digit_e = 0.0
-        check_freq = (random.randint(3,15) if label==1 else random.randint(1,3)) / 15
-        hour = random.choices(range(24),
-            weights=[3,2,2,2,2,2,3,4,5,5,5,5,5,5,5,5,5,5,6,7,8,8,6,4])[0] if label==1 \
-            else random.choices(range(24),
-            weights=[1,1,1,1,1,1,2,5,8,9,9,9,9,9,9,9,8,7,6,5,4,3,2,1])[0]
+
+        hour = random.choices(
+            range(24),
+            weights=[3,2,2,2,2,2,3,4,5,5,5,5,5,5,5,5,5,5,6,7,8,8,6,4]
+        )[0] if label == 1 else random.choices(
+            range(24),
+            weights=[1,1,1,1,1,1,2,5,8,9,9,9,9,9,9,9,8,7,6,5,4,3,2,1]
+        )[0]
         hour_norm = hour / 23
-        days_seen = (random.randint(0,30) if label==1 else random.randint(30,730)) / 365
-        return [luhn,tac_known,all_same,is_test,length_ok,
-                tac_theft,digit_e,check_freq,hour_norm,days_seen]
+        days_seen = (random.randint(0, 30) if label == 1 else random.randint(30, 730)) / 365
+
+        if imei.isdigit() and len(imei) == 15:
+            consecutive = sum(
+                1 for i in range(len(imei) - 1)
+                if int(imei[i + 1]) - int(imei[i]) == 1
+            ) / 14
+        else:
+            consecutive = 0.0
+
+        unique_digit_ratio = len(set(imei)) / 10 if imei.isdigit() else 0.0
+        is_night           = 1 if (hour >= 22 or hour <= 5) else 0
+
+        return [
+            luhn, tac_known_real, all_same, is_test, length_ok,
+            tac_theft, digit_e, hour_norm, days_seen,
+            consecutive, unique_digit_ratio, is_night,
+        ]
 
     records = []
     for _ in range(1800):
@@ -294,13 +384,13 @@ def train_and_save():
 
     rf = RandomForestClassifier(
         n_estimators=200, max_depth=8,
-        class_weight="balanced", random_state=42, n_jobs=-1
+        class_weight="balanced", random_state=42, n_jobs=-1,
     )
     rf.fit(X, y)
 
     iso = IsolationForest(
-        n_estimators=200, contamination=0.4,
-        random_state=42, n_jobs=-1
+        n_estimators=200, contamination=0.35,
+        random_state=42, n_jobs=-1,
     )
     iso.fit(X)
 
@@ -308,33 +398,47 @@ def train_and_save():
     iso_min    = float(iso_scores.min())
     iso_max    = float(iso_scores.max())
 
-    feature_names = ["luhn","tac_known","all_same","is_test","length_ok",
-                     "tac_theft_rate","digit_entropy","check_freq","hour_norm","days_seen"]
-
     bundle = {
-        "rf": rf, "iso": iso,
-        "iso_min": iso_min, "iso_max": iso_max,
-        "feature_names": feature_names,
-        "n_features": len(feature_names),
-        "version": "3.3"
+        "rf":            rf,
+        "iso":           iso,
+        "iso_min":       iso_min,
+        "iso_max":       iso_max,
+        "feature_names": FEATURE_NAMES,
+        "n_features":    len(FEATURE_NAMES),
+        "version":       "3.5",
     }
     joblib.dump(bundle, MODEL_PATH)
 
     metrics = {
-        "model_version":     "TraceIMEI-BJ v3.3-RF+IF",
-        "n_features":        len(feature_names),
-        "feature_names":     feature_names,
-        "dataset_size":      len(records),
-        "data_origin":       "synthetic_behavioral_v3",
-        "rf_estimators":     200,
-        "iso_contamination": 0.4,
-        "logic_note":        "VOLÉ=Supabase | SUSPECT=ML>=0.50 | LÉGITIME=ML<0.50",
-        "tac_source":        "Supabase cache + imeicheck.com fallback",
+        "model_version":        "TraceIMEI-BJ v3.5-RF+IF",
+        "n_features":           len(FEATURE_NAMES),
+        "feature_names":        FEATURE_NAMES,
+        "dataset_size":         len(records),
+        "data_origin":          "synthetic_behavioral_v3.5",
+        "rf_estimators":        200,
+        "iso_contamination":    0.35,
+        "iso_anomaly_threshold": ISO_ANOMALY_THRESHOLD,
+        "daily_check_threshold": DAILY_CHECK_THRESHOLD,
+        "logic_note": (
+            "VOLÉ=Supabase | "
+            "SUSPECT=IsolationForest>=0.50 OU verifications_imei>=5/jour | "
+            "LÉGITIME=sinon"
+        ),
+        "rf_role":     "score_display_only (pondération 40%)",
+        "iso_role":    "décideur principal anomalie (pondération 60%)",
+        "tac_source":  "Supabase cache + imeicheck.com fallback",
+        "changelog_v3.5": [
+            "RF retiré de la décision, rôle réduit à pondération score affichage",
+            "Isolation Forest = décideur principal anomalie (seuil 0.50)",
+            "Nouveau critère : IMEI vérifié >= 5 fois/jour via verifications_imei",
+            "check_freq et repeat_check supprimés des features ML (gérés par Supabase)",
+            "12 features au lieu de 14",
+        ],
     }
     with open(METRICS_PATH, "w") as f:
         json.dump(metrics, f, indent=2, ensure_ascii=False)
 
-    print("✅ Modèle v3.3 entraîné et sauvegardé.")
+    print(f"✅ Modèle v3.5 entraîné ({len(FEATURE_NAMES)} features) et sauvegardé.")
     return bundle, metrics
 
 # ────────────────────────────────────────────────────────────
@@ -345,6 +449,7 @@ MODEL   = None
 METRICS = {}
 REQUIRED_BUNDLE_KEYS = ["rf", "iso", "iso_min", "iso_max", "n_features"]
 
+
 def load_model():
     global MODEL, METRICS
     if os.path.exists(MODEL_PATH):
@@ -352,6 +457,10 @@ def load_model():
             loaded = joblib.load(MODEL_PATH)
             if not all(k in loaded for k in REQUIRED_BUNDLE_KEYS):
                 print("⚠️  Bundle incomplet, réentraînement forcé...")
+                MODEL, METRICS = train_and_save()
+                return
+            if loaded.get("n_features") != len(FEATURE_NAMES):
+                print(f"⚠️  n_features mismatch ({loaded.get('n_features')} vs {len(FEATURE_NAMES)}), réentraînement...")
                 MODEL, METRICS = train_and_save()
                 return
             MODEL = loaded
@@ -369,48 +478,66 @@ def load_model():
         with open(METRICS_PATH) as f:
             METRICS = json.load(f)
     else:
-        METRICS = {"model_version": "TraceIMEI-BJ v3.3-RF+IF"}
+        METRICS = {"model_version": "TraceIMEI-BJ v3.5-RF+IF"}
+
 
 load_model()
 
 # ────────────────────────────────────────────────────────────
-# SCORING
+# SCORING v3.5
 # ────────────────────────────────────────────────────────────
 
 def compute_ml_score(imei: str, ctx: dict = {}):
-    if imei in TEST_IMEIS:
-        return 0.99, "blacklist", "high"
-    if imei and len(imei) == 15 and len(set(imei)) == 1:
-        return 0.99, "blacklist", "high"
+    """
+    Retourne (score_display, iso_score, rf_proba, mode, confidence).
+    - iso_score  : score Isolation Forest normalisé [0,1] → décision SUSPECT
+    - rf_proba   : probabilité Random Forest [0,1] → contribution affichage seulement
+    - score_display : 0.40*rf + 0.60*iso → score affiché dans l'UI
+    """
+    if imei in TEST_IMEIS or (imei and len(imei) == 15 and len(set(imei)) == 1):
+        return 0.99, 0.99, 0.99, "blacklist", "high"
 
     if MODEL is None:
         score = 0.0
         if not luhn_check(imei): score += 0.40
         if len(imei) != 15:      score += 0.40
-        return round(min(score, 0.99), 3), "fallback_rules", "low"
+        return round(min(score, 0.99), 3), score, score, "fallback_rules", "low"
 
     X        = np.array([build_features(imei, ctx)])
     rf_proba = float(MODEL["rf"].predict_proba(X)[0][1])
     iso_raw  = float(-MODEL["iso"].decision_function(X)[0])
     iso_norm = float(np.clip(
-        (iso_raw - MODEL["iso_min"]) / (MODEL["iso_max"] - MODEL["iso_min"] + 1e-9), 0, 1
+        (iso_raw - MODEL["iso_min"]) / (MODEL["iso_max"] - MODEL["iso_min"] + 1e-9),
+        0, 1,
     ))
-    score = round(min(0.70 * rf_proba + 0.30 * iso_norm, 0.99), 3)
-    return score, "scoring_v3", "high"
+    score_display = round(min(0.40 * rf_proba + 0.60 * iso_norm, 0.99), 3)
+    return score_display, round(iso_norm, 3), round(rf_proba, 3), "scoring_v3.5", "high"
 
 
-def resolve_status(score: float, is_declared_stolen: bool) -> str:
+def resolve_status(
+    score_display: float,
+    iso_score: float,
+    is_declared_stolen: bool,
+    daily_count: int,
+) -> tuple:
     """
-    Logique métier v3.3 :
-      VOLÉ     → is_declared_stolen=True (source : Supabase)
-      SUSPECT  → score ML >= 0.50
-      LÉGITIME → score ML < 0.50
+    Logique métier v3.5 :
+      VOLÉ     → is_declared_stolen=True
+      SUSPECT  → iso_score >= ISO_ANOMALY_THRESHOLD
+                 OU daily_count >= DAILY_CHECK_THRESHOLD
+      LÉGITIME → sinon
+
+    Retourne (status, reason) pour transparence.
     """
     if is_declared_stolen:
-        return "vole"
-    if score >= 0.50:
-        return "suspect"
-    return "legitime"
+        return "vole", "declared_stolen"
+    if iso_score >= ISO_ANOMALY_THRESHOLD:
+        if daily_count >= DAILY_CHECK_THRESHOLD:
+            return "suspect", "anomalie_ml_et_frequence_journaliere"
+        return "suspect", "anomalie_ml"
+    if daily_count >= DAILY_CHECK_THRESHOLD:
+        return "suspect", "frequence_journaliere"
+    return "legitime", "aucune_anomalie"
 
 # ────────────────────────────────────────────────────────────
 # ROUTES
@@ -419,14 +546,20 @@ def resolve_status(score: float, is_declared_stolen: bool) -> str:
 @app.route("/", methods=["GET"])
 def index():
     return jsonify({
-        "name":         "TraceIMEI-BJ API",
-        "version":      "3.3.0",
-        "engine":       "Random Forest 70% + Isolation Forest 30%",
-        "n_features":   MODEL.get("n_features", 10) if MODEL else 10,
-        "status":       "running",
-        "model_loaded": MODEL is not None,
-        "tac_source":   "Supabase cache + imeicheck.com fallback",
-        "logic":        "VOLE=Supabase | SUSPECT=ML>=0.50 | LEGITIME=ML<0.50",
+        "name":                  "TraceIMEI-BJ API",
+        "version":               "3.5.0",
+        "engine":                "Isolation Forest (décision) + Random Forest (score display)",
+        "n_features":            len(FEATURE_NAMES),
+        "feature_names":         FEATURE_NAMES,
+        "iso_anomaly_threshold": ISO_ANOMALY_THRESHOLD,
+        "daily_check_threshold": DAILY_CHECK_THRESHOLD,
+        "status":                "running",
+        "model_loaded":          MODEL is not None,
+        "logic": (
+            "VOLE=Supabase | "
+            "SUSPECT=IF>=0.50 OU verifications/jour>=5 | "
+            "LEGITIME=sinon"
+        ),
     })
 
 
@@ -434,13 +567,16 @@ def index():
 def health():
     supabase_ok = bool(SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY)
     return jsonify({
-        "status":        "ok",
-        "model_loaded":  MODEL is not None,
-        "model_version": MODEL.get("version", "?") if MODEL else "none",
-        "scoring_mode":  "scoring_v3" if MODEL else "fallback_rules",
-        "supabase":      "connected" if supabase_ok else "missing_credentials",
-        "version":       "3.3.0",
-        "timestamp":     time.time(),
+        "status":                "ok",
+        "model_loaded":          MODEL is not None,
+        "model_version":         MODEL.get("version", "?") if MODEL else "none",
+        "n_features":            MODEL.get("n_features", 0) if MODEL else 0,
+        "scoring_mode":          "scoring_v3.5" if MODEL else "fallback_rules",
+        "iso_anomaly_threshold": ISO_ANOMALY_THRESHOLD,
+        "daily_check_threshold": DAILY_CHECK_THRESHOLD,
+        "supabase":              "connected" if supabase_ok else "missing_credentials",
+        "version":               "3.5.0",
+        "timestamp":             time.time(),
     })
 
 
@@ -452,11 +588,12 @@ def check_imei():
         "imei": "358441080000000",
         "is_declared_stolen": false,
         "context": {
-            "check_count": 1,
             "hour": 14,
             "days_since_first_seen": 0
         }
     }
+    Note : check_count n'est plus nécessaire dans le contexte.
+    La fréquence journalière est lue directement depuis Supabase.
     """
     start = time.time()
     data  = request.get_json()
@@ -467,31 +604,42 @@ def check_imei():
     ctx                = data.get("context", {})
     is_declared_stolen = bool(data.get("is_declared_stolen", False))
 
-    luhn                         = luhn_check(imei)
+    luhn_ok                      = luhn_check(imei)
     manufacturer, series, tac_ok = get_manufacturer(imei)
-    score, mode, confidence      = compute_ml_score(imei, ctx)
-    status                       = resolve_status(score, is_declared_stolen)
+    ctx["tac_found"]             = tac_ok
+
+    # Comptage Supabase : combien de fois cet IMEI a été vérifié aujourd'hui
+    daily_count = get_daily_check_count(imei)
+
+    score_display, iso_score, rf_proba, mode, confidence = compute_ml_score(imei, ctx)
+    status, reason = resolve_status(score_display, iso_score, is_declared_stolen, daily_count)
 
     return jsonify({
         "imei":               imei,
-        "score":              score,
+        "score":              score_display,
+        "iso_score":          iso_score,
+        "rf_proba":           rf_proba,
         "status":             status,
+        "suspect_reason":     reason,
         "is_declared_stolen": is_declared_stolen,
         "manufacturer":       manufacturer,
         "model_series":       series,
+        "daily_check_count":  daily_count,
+        "daily_threshold":    DAILY_CHECK_THRESHOLD,
+        "iso_threshold":      ISO_ANOMALY_THRESHOLD,
         "features": {
-            "luhn_valid":             luhn,
+            "luhn_valid":             luhn_ok,
             "imei_length_valid":      len(imei) == 15,
             "tac_code":               imei[:8] if len(imei) >= 8 else "",
             "tac_manufacturer_match": tac_ok,
             "all_same_digits":        len(set(imei)) == 1 if imei else False,
             "known_test_imei":        imei in TEST_IMEIS,
         },
-        "scoring_mode":       mode,
-        "confidence":         confidence,
-        "response_time_ms":   round((time.time() - start) * 1000, 2),
-        "model_version":      METRICS.get("model_version", "TraceIMEI-BJ v3.3-RF+IF"),
-        "logic_version":      "v3.3",
+        "scoring_mode":     mode,
+        "confidence":       confidence,
+        "response_time_ms": round((time.time() - start) * 1000, 2),
+        "model_version":    METRICS.get("model_version", "TraceIMEI-BJ v3.5-RF+IF"),
+        "logic_version":    "v3.5",
     })
 
 
@@ -517,26 +665,33 @@ def batch_check():
     for imei in imeis:
         imei               = str(imei).strip()
         is_declared_stolen = imei in declared_stolen_set
-        score, mode, confidence      = compute_ml_score(imei, ctx)
         manufacturer, series, tac_ok = get_manufacturer(imei)
-        status = resolve_status(score, is_declared_stolen)
+
+        imei_ctx             = {**ctx, "tac_found": tac_ok}
+        daily_count          = get_daily_check_count(imei)
+        score_display, iso_score, rf_proba, mode, confidence = compute_ml_score(imei, imei_ctx)
+        status, reason       = resolve_status(score_display, iso_score, is_declared_stolen, daily_count)
+
         results.append({
-            "imei":               imei,
-            "score":              score,
-            "status":             status,
-            "is_declared_stolen": is_declared_stolen,
-            "manufacturer":       manufacturer,
-            "model_series":       series,
-            "tac_match":          tac_ok,
-            "scoring_mode":       mode,
-            "confidence":         confidence,
+            "imei":              imei,
+            "score":             score_display,
+            "iso_score":         iso_score,
+            "status":            status,
+            "suspect_reason":    reason,
+            "is_declared_stolen":is_declared_stolen,
+            "manufacturer":      manufacturer,
+            "model_series":      series,
+            "tac_match":         tac_ok,
+            "daily_check_count": daily_count,
+            "scoring_mode":      mode,
+            "confidence":        confidence,
         })
 
     return jsonify({
         "results":       results,
         "total":         len(results),
-        "model_version": METRICS.get("model_version", "TraceIMEI-BJ v3.3-RF+IF"),
-        "logic_version": "v3.3",
+        "model_version": METRICS.get("model_version", "TraceIMEI-BJ v3.5-RF+IF"),
+        "logic_version": "v3.5",
     })
 
 
@@ -546,13 +701,44 @@ def retrain():
     try:
         MODEL, METRICS = train_and_save()
         return jsonify({
-            "status":     "ok",
-            "message":    "Modèle v3.3 réentraîné avec succès",
-            "version":    "3.3",
-            "n_features": MODEL["n_features"],
+            "status":        "ok",
+            "message":       "Modèle v3.5 réentraîné avec succès",
+            "version":       "3.5",
+            "n_features":    MODEL["n_features"],
+            "feature_names": MODEL["feature_names"],
         })
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@app.route("/api/features", methods=["GET"])
+def get_features():
+    descriptions = {
+        "luhn":              "Algorithme de Luhn valide (0/1)",
+        "tac_known_real":    "TAC reconnu via Supabase ou imeicheck.com (0/1)",
+        "all_same":          "Tous les chiffres identiques, ex: 111... (0/1)",
+        "is_test":           "IMEI dans la liste noire de test (0/1)",
+        "length_ok":         "Longueur exactement 15 chiffres (0/1)",
+        "tac_theft_rate":    "TAC appartient aux préfixes haute valeur (0.2/0.7)",
+        "digit_entropy":     "Entropie normalisée des chiffres (0.0–1.0)",
+        "hour_norm":         "Heure UTC normalisée (0.0–1.0)",
+        "days_seen":         "Ancienneté depuis première vérification, normalisée 365j",
+        "consecutive":       "Proportion de transitions consécutives +1 entre chiffres",
+        "unique_digit_ratio":"Ratio de chiffres uniques sur 10 possibles",
+        "is_night":          "Vérification entre 22h et 5h UTC (0/1)",
+    }
+    return jsonify({
+        "n_features":            len(FEATURE_NAMES),
+        "iso_anomaly_threshold": ISO_ANOMALY_THRESHOLD,
+        "daily_check_threshold": DAILY_CHECK_THRESHOLD,
+        "decision_logic":        "SUSPECT si iso_score>=0.50 OU daily_count>=5",
+        "rf_role":               "score affichage uniquement (pondération 40%)",
+        "features": [
+            {"name": name, "description": descriptions.get(name, "")}
+            for name in FEATURE_NAMES
+        ],
+        "model_version": METRICS.get("model_version", "TraceIMEI-BJ v3.5-RF+IF"),
+    })
 
 
 if __name__ == "__main__":
