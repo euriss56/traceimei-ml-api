@@ -1,15 +1,16 @@
 """
-TraceIMEI-BJ — API ML v3.7
+TraceIMEI-BJ — API ML v3.8
 Logique métier :
   - VOLÉ     → is_declared_stolen=True (source : Supabase)
-  - SUSPECT  → Isolation Forest iso_score >= 0.50
-               OU IMEI vérifié >= 5 fois dans la même journée
+  - SUSPECT  → IMEI vérifié >= 5 fois dans la même journée
   - LÉGITIME → aucune des conditions ci-dessus
 
-Changements v3.7 :
-  - hour_norm et days_seen supprimés — trop bruités sur données synthétiques
-  - RF réduit à 20% (score affichage), IF à 80%
-  - 8 features purement structurelles sur l'IMEI
+Changements v3.8 :
+  - Isolation Forest retiré de la décision finale (resolve_status)
+  - score_display = rf_proba uniquement (IF n'influence plus le score)
+  - iso_score retourné à 0.0 (neutralisé)
+  - Raisons anomalie_ml et anomalie_ml_et_frequence_journaliere supprimées
+  - scoring_mode mis à jour → "scoring_v3.8"
 
 Auteur : Euriss FANOU & Thierry MEHOUNOU — GETECH 2026
 """
@@ -52,7 +53,7 @@ TEST_IMEIS = {
 }
 
 DAILY_CHECK_THRESHOLD = 5
-ISO_ANOMALY_THRESHOLD = 0.50
+ISO_ANOMALY_THRESHOLD = 0.50  # conservé pour référence / affichage, n'impact plus la décision
 
 MODEL_PATH   = "traceimei_model.pkl"
 METRICS_PATH = "model_metrics.json"
@@ -66,7 +67,7 @@ FEATURE_NAMES = [
     "digit_entropy",
     "consecutive",
     "unique_digit_ratio",
-    "luhn_entropy_product",   # interaction : luhn × digit_entropy
+    "luhn_entropy_product",
 ]
 
 # ────────────────────────────────────────────────────────────
@@ -207,7 +208,7 @@ def build_features(imei: str) -> list:
             digit_e, consecutive, unique_digit_ratio, luhn_entropy_product]
 
 # ────────────────────────────────────────────────────────────
-# AUTO-TRAINING v3.7
+# AUTO-TRAINING v3.8
 # ────────────────────────────────────────────────────────────
 
 KNOWN_TAC_TRAIN = [
@@ -230,7 +231,7 @@ KNOWN_TAC_TRAIN = [
 def train_and_save():
     from sklearn.ensemble import RandomForestClassifier, IsolationForest
 
-    print("🔧 Entraînement du modèle v3.7 en cours...")
+    print("🔧 Entraînement du modèle v3.8 en cours...")
     random.seed(42)
     np.random.seed(42)
 
@@ -292,10 +293,8 @@ def train_and_save():
         return build_features(imei)
 
     records = []
-    # Légitimes : IMEI valides générés depuis TAC connus
     for _ in range(2000):
         records.append(_features(_gen_valid_imei()) + [0])
-    # Suspects : IMEI mal formés
     for _ in range(1000):
         records.append(_features(_gen_fake_imei()) + [1])
 
@@ -309,7 +308,6 @@ def train_and_save():
     )
     rf.fit(X, y)
 
-    # contamination=0.20 : on s'attend à 20% d'IMEI suspects dans la vraie vie
     iso = IsolationForest(
         n_estimators=200, contamination=0.20,
         random_state=42, n_jobs=-1,
@@ -327,12 +325,12 @@ def train_and_save():
         "iso_max":       iso_max,
         "feature_names": FEATURE_NAMES,
         "n_features":    len(FEATURE_NAMES),
-        "version":       "3.7",
+        "version":       "3.8",
     }
     joblib.dump(bundle, MODEL_PATH)
 
     metrics = {
-        "model_version":         "TraceIMEI-BJ v3.7-RF+IF",
+        "model_version":         "TraceIMEI-BJ v3.8-RF",
         "n_features":            len(FEATURE_NAMES),
         "feature_names":         FEATURE_NAMES,
         "dataset_size":          len(records),
@@ -341,26 +339,27 @@ def train_and_save():
         "iso_contamination":     0.20,
         "iso_anomaly_threshold": ISO_ANOMALY_THRESHOLD,
         "daily_check_threshold": DAILY_CHECK_THRESHOLD,
-        "rf_weight":             0.20,
-        "iso_weight":            0.80,
+        "rf_weight":             1.0,
+        "iso_weight":            0.0,
         "logic_note": (
             "VOLÉ=Supabase | "
-            "SUSPECT=IF>=0.50 OU verifications_imei>=5/jour | "
-            "LÉGITIME=sinon"
+            "SUSPECT=verifications_imei>=5/jour | "
+            "LÉGITIME=sinon | "
+            "IF conservé en bundle mais neutralisé dans la décision"
         ),
-        "changelog_v3.7": [
-            "hour_norm supprimé — biais temporel synthétique",
-            "days_seen supprimé — toujours 0 en production",
-            "RF réduit à 20% (score display), IF à 80%",
-            "contamination IF abaissée à 0.20 (plus réaliste)",
-            "Ajout feature luhn_entropy_product (interaction)",
-            "8 features purement structurelles",
+        "changelog_v3.8": [
+            "Isolation Forest retiré de resolve_status — ne rend plus un IMEI suspect",
+            "score_display = rf_proba uniquement (IF n'influence plus le score affiché)",
+            "iso_score retourné à 0.0 dans toutes les réponses API",
+            "Raisons anomalie_ml et anomalie_ml_et_frequence_journaliere supprimées",
+            "scoring_mode mis à jour → scoring_v3.8",
+            "RF conservé comme seul indicateur de score ML",
         ],
     }
     with open(METRICS_PATH, "w") as f:
         json.dump(metrics, f, indent=2, ensure_ascii=False)
 
-    print(f"✅ Modèle v3.7 entraîné ({len(FEATURE_NAMES)} features) et sauvegardé.")
+    print(f"✅ Modèle v3.8 entraîné ({len(FEATURE_NAMES)} features) et sauvegardé.")
     return bundle, metrics
 
 # ────────────────────────────────────────────────────────────
@@ -400,44 +399,42 @@ def load_model():
         with open(METRICS_PATH) as f:
             METRICS = json.load(f)
     else:
-        METRICS = {"model_version": "TraceIMEI-BJ v3.7-RF+IF"}
+        METRICS = {"model_version": "TraceIMEI-BJ v3.8-RF"}
 
 
 load_model()
 
 # ────────────────────────────────────────────────────────────
-# SCORING
+# SCORING v3.8 — RF uniquement, IF neutralisé
 # ────────────────────────────────────────────────────────────
 
 def compute_ml_score(imei: str):
     if imei in TEST_IMEIS or (imei and len(imei) == 15 and len(set(imei)) == 1):
-        return 0.99, 0.99, 0.99, "blacklist", "high"
+        return 0.99, 0.0, 0.99, "blacklist", "high"
 
     if MODEL is None:
         score = 0.0
         if not luhn_check(imei): score += 0.40
         if len(imei) != 15:      score += 0.40
-        return round(min(score, 0.99), 3), score, score, "fallback_rules", "low"
+        return round(min(score, 0.99), 3), 0.0, score, "fallback_rules", "low"
 
     X        = np.array([build_features(imei)])
     rf_proba = float(MODEL["rf"].predict_proba(X)[0][1])
-    iso_raw  = float(-MODEL["iso"].decision_function(X)[0])
-    iso_norm = float(np.clip(
-        (iso_raw - MODEL["iso_min"]) / (MODEL["iso_max"] - MODEL["iso_min"] + 1e-9),
-        0, 1,
-    ))
-    # RF 20% uniquement pour l'affichage — IF 80% décide
-    score_display = round(min(0.20 * rf_proba + 0.80 * iso_norm, 0.99), 3)
-    return score_display, round(iso_norm, 3), round(rf_proba, 3), "scoring_v3.7", "high"
+
+    # IF conservé en bundle mais iso_score neutralisé → retourné à 0.0
+    score_display = round(rf_proba, 3)
+    return score_display, 0.0, round(rf_proba, 3), "scoring_v3.8", "high"
 
 
 def resolve_status(iso_score, is_declared_stolen, daily_count):
+    """
+    v3.8 — Isolation Forest retiré de la décision.
+    VOLÉ    → is_declared_stolen=True (Supabase)
+    SUSPECT → daily_count >= DAILY_CHECK_THRESHOLD
+    LÉGITIME → sinon
+    """
     if is_declared_stolen:
         return "vole", "declared_stolen"
-    if iso_score >= ISO_ANOMALY_THRESHOLD:
-        if daily_count >= DAILY_CHECK_THRESHOLD:
-            return "suspect", "anomalie_ml_et_frequence_journaliere"
-        return "suspect", "anomalie_ml"
     if daily_count >= DAILY_CHECK_THRESHOLD:
         return "suspect", "frequence_journaliere"
     return "legitime", "aucune_anomalie"
@@ -450,15 +447,15 @@ def resolve_status(iso_score, is_declared_stolen, daily_count):
 def index():
     return jsonify({
         "name":                  "TraceIMEI-BJ API",
-        "version":               "3.7.0",
-        "engine":                "Isolation Forest 80% + Random Forest 20% (display)",
+        "version":               "3.8.0",
+        "engine":                "Random Forest 100% (Isolation Forest neutralisé)",
         "n_features":            len(FEATURE_NAMES),
         "feature_names":         FEATURE_NAMES,
         "iso_anomaly_threshold": ISO_ANOMALY_THRESHOLD,
         "daily_check_threshold": DAILY_CHECK_THRESHOLD,
         "status":                "running",
         "model_loaded":          MODEL is not None,
-        "logic": "VOLE=Supabase | SUSPECT=IF>=0.50 OU verifications/jour>=5 | LEGITIME=sinon",
+        "logic": "VOLE=Supabase | SUSPECT=verifications/jour>=5 | LEGITIME=sinon",
     })
 
 
@@ -470,11 +467,11 @@ def health():
         "model_loaded":          MODEL is not None,
         "model_version":         MODEL.get("version", "?") if MODEL else "none",
         "n_features":            MODEL.get("n_features", 0) if MODEL else 0,
-        "scoring_mode":          "scoring_v3.7" if MODEL else "fallback_rules",
+        "scoring_mode":          "scoring_v3.8" if MODEL else "fallback_rules",
         "iso_anomaly_threshold": ISO_ANOMALY_THRESHOLD,
         "daily_check_threshold": DAILY_CHECK_THRESHOLD,
         "supabase":              "connected" if supabase_ok else "missing_credentials",
-        "version":               "3.7.0",
+        "version":               "3.8.0",
         "timestamp":             time.time(),
     })
 
@@ -501,7 +498,7 @@ def check_imei():
     return jsonify({
         "imei":               imei,
         "score":              score_display,
-        "iso_score":          iso_score,
+        "iso_score":          0,           # neutralisé en v3.8
         "rf_proba":           rf_proba,
         "status":             status,
         "suspect_reason":     reason,
@@ -523,8 +520,8 @@ def check_imei():
         "scoring_mode":     mode,
         "confidence":       confidence,
         "response_time_ms": round((time.time() - start) * 1000, 2),
-        "model_version":    METRICS.get("model_version", "TraceIMEI-BJ v3.7-RF+IF"),
-        "logic_version":    "v3.7",
+        "model_version":    METRICS.get("model_version", "TraceIMEI-BJ v3.8-RF"),
+        "logic_version":    "v3.8",
     })
 
 
@@ -548,7 +545,7 @@ def batch_check():
         results.append({
             "imei":               imei,
             "score":              score_display,
-            "iso_score":          iso_score,
+            "iso_score":          0,           # neutralisé en v3.8
             "status":             status,
             "suspect_reason":     reason,
             "is_declared_stolen": is_declared_stolen,
@@ -563,8 +560,8 @@ def batch_check():
     return jsonify({
         "results":       results,
         "total":         len(results),
-        "model_version": METRICS.get("model_version", "TraceIMEI-BJ v3.7-RF+IF"),
-        "logic_version": "v3.7",
+        "model_version": METRICS.get("model_version", "TraceIMEI-BJ v3.8-RF"),
+        "logic_version": "v3.8",
     })
 
 
@@ -575,8 +572,8 @@ def retrain():
         MODEL, METRICS = train_and_save()
         return jsonify({
             "status":        "ok",
-            "message":       "Modèle v3.7 réentraîné avec succès",
-            "version":       "3.7",
+            "message":       "Modèle v3.8 réentraîné avec succès",
+            "version":       "3.8",
             "n_features":    MODEL["n_features"],
             "feature_names": MODEL["feature_names"],
         })
@@ -600,14 +597,14 @@ def get_features():
         "n_features":            len(FEATURE_NAMES),
         "iso_anomaly_threshold": ISO_ANOMALY_THRESHOLD,
         "daily_check_threshold": DAILY_CHECK_THRESHOLD,
-        "decision_logic":        "SUSPECT si iso_score>=0.50 OU daily_count>=5",
-        "rf_weight":             "20% (score display uniquement)",
-        "iso_weight":            "80% (décideur principal)",
+        "decision_logic":        "SUSPECT si daily_count>=5 uniquement (IF neutralisé)",
+        "rf_weight":             "100% (seul décideur ML)",
+        "iso_weight":            "0% (neutralisé en v3.8)",
         "features": [
             {"name": n, "description": descriptions.get(n, "")}
             for n in FEATURE_NAMES
         ],
-        "model_version": METRICS.get("model_version", "TraceIMEI-BJ v3.7-RF+IF"),
+        "model_version": METRICS.get("model_version", "TraceIMEI-BJ v3.8-RF"),
     })
 
 
